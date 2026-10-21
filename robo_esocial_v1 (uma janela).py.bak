@@ -1,0 +1,290 @@
+# -*- coding: utf-8 -*-
+"""Robô eSocial: roda TODA a sequência de scripts (FGTS ou INSS) de 10 em 10, sozinho.
+
+Ciclo para cada parte:  entra no eSocial (gov.br > certificado)  ->  roda a parte de 10  ->  baixa o ZIP
+                        ->  sai do eSocial  ->  fecha a aba  ->  abre aba nova  ->  próxima parte.
+Você só escolhe o certificado (e o PIN) na PRIMEIRA vez: o Edge guarda a escolha enquanto a janela estiver aberta.
+O robô não toca em senha nem em certificado.
+
+Uso:  py -3 robo_esocial.py fgts            (ou inss)
+      py -3 robo_esocial.py fgts --desde 7  (recomeça da 7ª parte da sequência)
+      py -3 robo_esocial.py fgts --testar   (só lista a sequência e vai até a tela do gov.br, sem clicar no certificado)
+Opções: --comp 09.2026 (padrão: a pasta de mês mais recente em Conferencia Claudinho\\eSocial)
+Os ZIPs vão para  Conferencia Claudinho\\eSocial\\<MM.AAAA>\\ZIPs ; o andamento fica em _andamento_<tipo>.txt.
+Só biblioteca padrão do Python."""
+import base64
+import datetime as dt
+import glob
+import json
+import os
+import random
+import re
+import socket
+import struct
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.request
+
+ESOCIAL = os.path.join(r'C:\Users', os.environ.get('USERNAME', ''), r'DrillGeo Dropbox\RH-DP\Conferencia Claudinho\eSocial')
+if not os.path.isdir(ESOCIAL):
+    ESOCIAL = r'C:\Users\USUARIO 1\DrillGeo Dropbox\RH-DP\Conferencia Claudinho\eSocial'
+EDGES = [r'C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe', r'C:\Program Files\Microsoft\Edge\Application\msedge.exe']
+LOGIN = 'https://login.esocial.gov.br/login.aspx'
+LOGOUT = 'https://login.esocial.gov.br/Logout.aspx'
+ORDEM_UNIDADES = ['VALE_NORTE', 'VALE_SUL', 'VRCN', 'VRTSF']
+CFG = {'fgts': {'pasta': 'FGTS', 'menu': '#menuFgtsTrabalhador', 'res': 'esocialFgtsResultado', 'padrao': 'esocial_fgts_*.js'},
+       'inss': {'pasta': 'INSS', 'menu': '#menuContribuicaoSocialTrabalhador', 'res': 'esocialInssResultado', 'padrao': 'INSS_*.js'}}
+
+args = sys.argv[1:]
+if not args or args[0].lower() not in CFG:
+    print(__doc__)
+    sys.exit(1)
+TIPO = args[0].lower()
+C = CFG[TIPO]
+TESTAR = '--testar' in args
+DESDE = int(args[args.index('--desde') + 1]) if '--desde' in args else 1
+COMP = args[args.index('--comp') + 1] if '--comp' in args else \
+    sorted((d for d in os.listdir(ESOCIAL) if re.fullmatch(r'\d{2}\.\d{4}', d)), key=lambda d: (d[3:], d[:2]))[-1]
+BASE = os.path.join(ESOCIAL, COMP)
+ZIPS = os.path.join(BASE, 'ZIPs')
+os.makedirs(ZIPS, exist_ok=True)
+LOG = os.path.join(ZIPS, f'_andamento_{TIPO}.txt')
+
+
+def aviso(msg):
+    linha = f'{dt.datetime.now():%H:%M:%S}  {msg}'
+    print(linha, flush=True)
+    with open(LOG, 'a', encoding='utf-8') as f:
+        f.write(linha + '\n')
+
+
+def chave(arq):
+    n = os.path.basename(arq)
+    u = next((i for i, x in enumerate(ORDEM_UNIDADES) if f'_{x}_' in n), 99)
+    m = re.search(r'_(\d+)de(\d+)\.js$', n)
+    return (u, int(m.group(1)) if m else 0)
+
+
+PARTES = sorted(glob.glob(os.path.join(BASE, C['pasta'], C['padrao'])), key=chave)
+
+
+# ---------------- WebSocket mínimo + protocolo do Edge (DevTools) ----------------
+class CDP:
+    def __init__(self, url):
+        hostport, caminho = url[len('ws://'):].split('/', 1)
+        h, p = hostport.split(':')
+        self.s = socket.create_connection((h, int(p)), timeout=15)
+        k = base64.b64encode(os.urandom(16)).decode()
+        self.s.sendall((f'GET /{caminho} HTTP/1.1\r\nHost: {hostport}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n'
+                        f'Sec-WebSocket-Key: {k}\r\nSec-WebSocket-Version: 13\r\n\r\n').encode())
+        r = b''
+        while b'\r\n\r\n' not in r:
+            r += self.s.recv(4096)
+        if b' 101 ' not in r.split(b'\r\n')[0]:
+            raise RuntimeError('o Edge recusou a conexão')
+        self.n = 0
+
+    def _env(self, txt):
+        d = txt.encode()
+        cab = bytearray([0x81])
+        cab += bytes([0x80 | len(d)]) if len(d) < 126 else (bytes([0x80 | 126]) + struct.pack('>H', len(d)) if len(d) < 65536
+                                                            else bytes([0x80 | 127]) + struct.pack('>Q', len(d)))
+        m = os.urandom(4)
+        self.s.sendall(bytes(cab) + m + bytes(b ^ m[i % 4] for i, b in enumerate(d)))
+
+    def _ler(self, n):
+        b = b''
+        while len(b) < n:
+            x = self.s.recv(n - len(b))
+            if not x:
+                raise ConnectionError('conexão fechada')
+            b += x
+        return b
+
+    def _rec(self):
+        msg = b''
+        while True:
+            b1, b2 = self._ler(2)
+            t = b2 & 0x7F
+            if t == 126:
+                t = struct.unpack('>H', self._ler(2))[0]
+            elif t == 127:
+                t = struct.unpack('>Q', self._ler(8))[0]
+            msg += self._ler(t)
+            if b1 & 0x80:
+                return msg.decode('utf-8', 'replace')
+
+    def call(self, metodo, params=None, espera=15):
+        self.n += 1
+        self.s.settimeout(espera)
+        self._env(json.dumps({'id': self.n, 'method': metodo, 'params': params or {}}))
+        while True:
+            r = json.loads(self._rec())
+            if r.get('id') == self.n:
+                if 'error' in r:
+                    raise RuntimeError(r['error'].get('message'))
+                return r.get('result', {})
+
+    def js(self, codigo, espera=15, promessa=False):
+        r = self.call('Runtime.evaluate', {'expression': codigo, 'returnByValue': True, 'awaitPromise': promessa}, espera)
+        return r.get('result', {}).get('value')
+
+    def fechar(self):
+        try:
+            self.s.close()
+        except Exception:
+            pass
+
+
+# ---------------- Edge ----------------
+edge = next((e for e in EDGES if os.path.exists(e)), None)
+if not edge:
+    print('Edge não encontrado.')
+    sys.exit(1)
+aviso(f'===== Robô eSocial {TIPO.upper()} {COMP}: {len(PARTES)} partes; começando na {DESDE}ª =====')
+for i, p in enumerate(PARTES, 1):
+    print(f'   {i:2d}. {os.path.basename(p)}{"   (pular)" if i < DESDE else ""}')
+if not PARTES:
+    aviso('Nenhum script encontrado na pasta ' + os.path.join(BASE, C['pasta']))
+    sys.exit(1)
+
+porta = random.randint(20000, 40000)
+perfil = tempfile.mkdtemp(prefix='esocial_robo_')
+subprocess.Popen([edge, f'--remote-debugging-port={porta}', '--remote-debugging-address=127.0.0.1',
+                  f'--user-data-dir={perfil}', '--no-first-run', '--no-default-browser-check', 'about:blank'])
+JS = f'http://127.0.0.1:{porta}/json'
+for _ in range(60):
+    try:
+        ver = json.load(urllib.request.urlopen(JS + '/version', timeout=2))
+        break
+    except Exception:
+        time.sleep(0.5)
+else:
+    aviso('Não consegui controlar o Edge.')
+    sys.exit(1)
+nav = CDP(ver['webSocketDebuggerUrl'])        # controle do navegador (abas e downloads)
+# Sessão anônima (igual ao InPrivate: só na memória, nada gravado em disco). A janela InPrivate do Edge não aceita
+# abas abertas por automação, por isso o robô cria a própria sessão anônima e abre todas as abas nela.
+CTX = nav.call('Target.createBrowserContext', {'disposeOnDetach': True})['browserContextId']
+
+
+def aba_nova():
+    p = {'url': 'about:blank'}
+    if CTX:
+        p['browserContextId'] = CTX
+    t = nav.call('Target.createTarget', p)['targetId']
+    info = None
+    for _ in range(20):
+        info = next((a for a in json.load(urllib.request.urlopen(JS, timeout=5)) if a.get('id') == t), None)
+        if info:
+            break
+        time.sleep(0.3)
+    d = {'behavior': 'allow', 'downloadPath': ZIPS}
+    if CTX:
+        d['browserContextId'] = CTX
+    nav.call('Browser.setDownloadBehavior', d)
+    pg_ = CDP(info['webSocketDebuggerUrl'])
+    pg_.call('Page.enable')
+    return t, pg_
+
+
+def fechar_abas_iniciais(exceto):
+    for a in json.load(urllib.request.urlopen(JS, timeout=5)):
+        if a.get('type') == 'page' and a['id'] != exceto:
+            try:
+                nav.call('Target.closeTarget', {'targetId': a['id']})
+            except Exception:
+                pass
+
+
+PASSO = r'''(() => {
+  const h = location.hostname;
+  if (document.querySelector('__MENU__')) return 'logado';
+  if (h === 'login.esocial.gov.br') {
+    const b = document.querySelector('button.sign-in');
+    if (b && document.readyState === 'complete') { b.click(); return 'clicou-govbr'; }
+    return 'esperando-esocial';
+  }
+  if (h === 'sso.acesso.gov.br') {
+    const c = document.querySelector('#login-certificate');
+    if (!c || document.readyState !== 'complete') return 'esperando-govbr';
+    if (__TESTAR__) return 'teste-ok';
+    if (window.__roboClicou) return 'esperando-certificado';
+    window.__roboClicou = true; c.click(); return 'clicou-certificado';
+  }
+  return 'tela:' + h + location.pathname;
+})()'''.replace('__MENU__', C['menu']).replace('__TESTAR__', 'true' if TESTAR else 'false')
+
+
+def entrar(pg, limite):
+    pg.call('Page.navigate', {'url': LOGIN})
+    fim, ult = time.time() + limite, ''
+    while time.time() < fim:
+        try:
+            e = pg.js(PASSO) or ''
+        except Exception:
+            e = 'carregando'
+        if e == 'logado':
+            return True
+        if e == 'teste-ok':
+            aviso('TESTE OK: chegou na tela do gov.br e achou "Seu certificado digital" (não clicou).')
+            return False
+        if e != ult and not e.startswith('esperando') and e != 'carregando':
+            aviso({'clicou-govbr': 'eSocial: clicou em "Entrar com gov.br"',
+                   'clicou-certificado': 'gov.br: clicou em "Seu certificado digital" – escolha o certificado se o Edge pedir'}
+                  .get(e, f'aguardando ({e}) – se o eSocial pedir algo (perfil, aviso), clique você'))
+        ult = e
+        time.sleep(1)
+    aviso('Não entrou no eSocial a tempo.')
+    return False
+
+
+# ---------------- ciclo ----------------
+alvo_id, pg = aba_nova()
+fechar_abas_iniciais(alvo_id)
+primeira = True
+resumo = []
+for i, arq in enumerate(PARTES, 1):
+    if i < DESDE:
+        continue
+    nome = os.path.basename(arq)
+    if not entrar(pg, 300 if primeira else 120):
+        if TESTAR:
+            break
+        aviso(f'Parei antes da parte {i} ({nome}). Para continuar depois:  py -3 robo_esocial.py {TIPO} --desde {i}')
+        break
+    primeira = False
+    aviso(f'Parte {i}/{len(PARTES)}: {nome} – rodando...')
+    codigo = 'window.alert = m => console.log("[aviso] " + m);\n' + open(arq, encoding='utf-8').read()
+    t0 = time.time()
+    try:
+        pg.js(codigo, espera=1800, promessa=True)
+        st = pg.js(f'JSON.stringify((window.{C["res"]} || []).map(l => l.status))') or '[]'
+        st = json.loads(st)
+    except Exception as e:
+        st = []
+        aviso(f'   erro ao rodar: {e}')
+    cont = {s: st.count(s) for s in sorted(set(st))}
+    aviso(f'   terminou em {round(time.time() - t0)} s: {len(st)} pessoas {cont}')
+    resumo.append((i, nome, len(st), cont))
+    if not st:
+        aviso(f'   Sem resultado. Para recomeçar desta parte:  py -3 robo_esocial.py {TIPO} --desde {i}')
+    # sair, fechar a aba e abrir outra (sessão nova = portal rápido)
+    time.sleep(3)                          # deixa o download do ZIP terminar
+    try:
+        pg.call('Page.navigate', {'url': LOGOUT})
+        time.sleep(3)
+    except Exception:
+        pass
+    pg.fechar()
+    nav.call('Target.closeTarget', {'targetId': alvo_id})
+    alvo_id, pg = aba_nova()
+
+if not TESTAR:
+    aviso('===== FIM =====')
+    for i, nome, n, cont in resumo:
+        aviso(f'   {i:2d}. {nome}: {n} pessoas {cont}')
+    aviso(f'ZIPs em: {ZIPS}')
+    aviso('Pode fechar a janela do Edge.')
