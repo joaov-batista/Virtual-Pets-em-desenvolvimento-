@@ -1,4 +1,50 @@
 {
   "modo": "parado",
-  "atalho": false
+  "atalho": false,
+  "vida": {
+    "energia": 52.91063896878557,
+    "oleo": 96.19276109696901,
+    "humor": 93.29917920690806,
+    "sonda": 46.12928656707597,
+    "quebrada": false,
+    "suja": false,
+    "dinheiro": 669,
+    "testemunhos": 17,
+    "premios": [
+      "Primeiro testemunho",
+      "Primeiro Cobre",
+      "Sondador iniciante",
+      "Primeiro Ferro",
+      "Primeiro Diamante",
+      "Estreia: fundos removidos",
+      "Estreia: imagens convertidas",
+      "10 testemunhos"
+    ],
+    "minerios": {
+      "Rocha": 9,
+      "Cobre": 1,
+      "Ferro": 4,
+      "Diamante": 3
+    },
+    "furo": 77.33762357608714,
+    "metros": 344.0,
+    "usos": {
+      "fundo": 1,
+      "imagem": 1
+    },
+    "uso_dia": {
+      "fundo": "2026-10-22",
+      "imagem": "2026-10-22"
+    },
+    "pecas": {
+      "broca": 39.89280087888985,
+      "haste": 35.29270498506787,
+      "bomba": 68.26108716393266,
+      "motor": 64.15720034593667,
+      "painel": 30.284996274223765,
+      "fiacao": 45.12746361059054,
+      "bateria": 39.88875271089045
+    }
+  },
+  "vida_ts": 1792679110.911435
 }
